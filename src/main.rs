@@ -1,8 +1,11 @@
 #![feature(in_band_lifetimes)]
 
 use std::borrow::Cow;
+use std::cmp::{max, min};
+use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
+use std::time::Instant;
 
 use clap::{App, Arg};
 
@@ -39,7 +42,14 @@ fn main() {
 
   match (matches.value_of(ARG_URL[0]), matches.value_of(ARG_PROFILE[0])) {
     (Some(url), None) => {
-      request(&parse_url(url, verbose));
+      match request(&parse_url(url, verbose)) {
+        Ok(buf) => {
+          println!("{}", String::from_utf8_lossy(&buf));
+        }
+        Err(err) => {
+          print!("Request to [{}] returned error code: [{}]", url, err);
+        }
+      }
     }
     (url_opt, Some(n)) => {
       let url = url_opt.unwrap_or(URL_MY_SITE);
@@ -95,7 +105,7 @@ fn parse_url(mut url: &str, verbose: bool) -> URL {
   rv
 }
 
-fn request(addr: &URL) {
+fn request(addr: &URL) -> Result<Vec<u8>, u16> {
   let tcp_stream = {
     let s = format!("{}:{}", &addr.hostname, if addr.is_https { 443 } else { 80 });
     TcpStream::connect(&s).expect(&format!("TcpStream failed to connect to: [{}]", &s))
@@ -107,15 +117,84 @@ fn request(addr: &URL) {
   };
 
   let s = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", &addr.path, &addr.hostname);
-  println!("{}",s);
   tls_stream.write_all(s.as_bytes()).unwrap();
 
   let mut buf = vec![];
   tls_stream.read_to_end(&mut buf).unwrap();
-  println!("{}", String::from_utf8_lossy(&buf));
+
+  const HTTP_1_1: &str = "HTTP/1.1";
+  if (&buf[HTTP_1_1.len() + 1..]).starts_with("200".as_bytes()) {
+    Ok(buf)
+  } else {
+    let s = unsafe { std::str::from_utf8_unchecked(&buf[HTTP_1_1.len() + 1..=HTTP_1_1.len() + 3]) };
+    Err(s.parse::<u16>().unwrap())
+  }
 }
 
-fn profile(addr: &URL, n: usize) {}
+fn profile(addr: &URL, n: usize) {
+  let mut time = vec![];
+  let mut err_code = HashSet::new();
+  let mut resp_len = [None, None];
+
+  for _ in 1..=n {
+    let start = Instant::now();
+    let resp = request(addr);
+    let dur = start.elapsed().as_millis();
+
+    match resp.map(|v| v.len()) {
+      Ok(sz) => {
+        time.push(dur);
+        resp_len[0] = Some(if let Some(x) = resp_len[0] { min(x, sz) } else { sz });
+        resp_len[1] = Some(if let Some(x) = resp_len[1] { max(x, sz) } else { sz });
+      }
+      Err(err) => {
+        err_code.insert(err);
+      }
+    }
+  }
+
+  println!("Number of requests: {}", n);
+
+  if !time.is_empty() {
+    time.sort_unstable();
+    println!("The fastest time: {}ms", time.first().unwrap());
+    println!("The slowest time: {}ms", time.last().unwrap());
+    println!("The mean    time: {}ms", (&time).into_iter().sum::<u128>() as f32 / (&time).len() as f32);
+    println!("The median  time: {}ms", time[time.len() / 2]);
+  } else {
+    time.sort_unstable();
+    println!("No stats for the fastest time (failed requests do not count).");
+    println!("No stats for the slowest time (failed requests do not count).");
+    println!("No stats for the mean    time (failed requests do not count).");
+    println!("No stats for the median  time (failed requests do not count).");
+  }
+
+  println!("The percentage of requests that succeeded: {}%", time.len() as f32 / n as f32 * 100 as f32);
+
+  if err_code.is_empty() {
+    println!("No error occured. Good!");
+  } else {
+    print!("Error code(s) occured: [");
+
+    let mut iter = err_code.iter();
+    print!("{}", iter.next().unwrap());
+    for code in iter {
+      print!(", {}", code);
+    }
+    println!("]");
+  }
+
+  match resp_len {
+    [Some(minn), Some(maxx)] => {
+      println!("The size in bytes of the smallest response: {}", minn);
+      println!("The size in bytes of the largest  response: {}", maxx);
+    }
+    _ => {
+      println!("No stats for size in bytes of smallest response (failed requests do not count).");
+      println!("No stats for size in bytes of largest  response (failed requests do not count).");
+    }
+  }
+}
 
 
 #[test]
