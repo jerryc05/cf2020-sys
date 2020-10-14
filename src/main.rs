@@ -106,28 +106,33 @@ fn parse_url(mut url: &str, verbose: bool) -> URL {
 }
 
 fn request(addr: &URL) -> Result<Vec<u8>, u16> {
-  let tcp_stream = {
+  let mut tcp_stream = {
     let s = format!("{}:{}", &addr.hostname, if addr.is_https { 443 } else { 80 });
     TcpStream::connect(&s).expect(&format!("TcpStream failed to connect to: [{}]", &s))
   };
-  let mut tls_stream = {
-    let s = &addr.hostname;
-    CONNECTOR.connect(s, tcp_stream)
-        .expect(&format!("TlsStream failed to connect to: [{}]", s))
-  };
-
-  let s = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", &addr.path, &addr.hostname);
-  tls_stream.write_all(s.as_bytes()).unwrap();
-
   let mut buf = vec![];
-  tls_stream.read_to_end(&mut buf).unwrap();
+  let s = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", &addr.path, &addr.hostname);
+
+  if addr.is_https {
+    let mut tls_stream = {
+      let s = &addr.hostname;
+      CONNECTOR.connect(s, tcp_stream)
+          .expect(&format!("TlsStream failed to connect to: [{}]", s))
+    };
+
+    tls_stream.write_all(s.as_bytes()).expect("Cannot write to TlsStream");
+    tls_stream.read_to_end(&mut buf).expect("Cannot read from TlsStream");
+  } else {
+    tcp_stream.write_all(s.as_bytes()).expect("Cannot write to TcpStream");
+    tcp_stream.read_to_end(&mut buf).expect("Cannot read from TcpStream");
+  }
 
   const HTTP_1_1: &str = "HTTP/1.1";
   if (&buf[HTTP_1_1.len() + 1..]).starts_with("200".as_bytes()) {
     Ok(buf)
   } else {
     let s = unsafe { std::str::from_utf8_unchecked(&buf[HTTP_1_1.len() + 1..=HTTP_1_1.len() + 3]) };
-    Err(s.parse::<u16>().unwrap())
+    Err(s.parse::<u16>().expect(&format!("Failed to parse HTTP status code: [{}]", s)))
   }
 }
 
@@ -160,7 +165,15 @@ fn profile(addr: &URL, n: usize) {
     println!("The fastest time: {}ms", time.first().unwrap());
     println!("The slowest time: {}ms", time.last().unwrap());
     println!("The mean    time: {}ms", (&time).into_iter().sum::<u128>() as f32 / (&time).len() as f32);
-    println!("The median  time: {}ms", time[time.len() / 2]);
+    { // median
+      print!("The median  time: ");
+      if time.len() % 2 != 0 {
+        print!("{}", time[time.len() / 2]);
+      } else {
+        print!("{}", (time[time.len() / 2] as f32 + time[time.len() / 2 + 1] as f32) / 2 as f32);
+      }
+      println!("ms");
+    }
   } else {
     time.sort_unstable();
     println!("No stats for the fastest time (failed requests do not count).");
